@@ -1,0 +1,9 @@
+# Run on Python 3.12 with: gymnasium 1.4.0, numpy 2.x, pygame 2.6.1,
+# stable_baselines3 2.9.2, torch 2.15.0 (CPU).
+gymnasium
+numpy
+pygame
+stable_baselines3
+torch
+
+# Optional, for the training curves: pip install tensorboard

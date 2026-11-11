@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Training output: every run saves hundreds of models and logs.
+# Only the one model that is kept is in git.
+models/*
+!models/best/
+logs/
+out/
+
+# Editors and operating systems
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
