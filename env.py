@@ -1,16 +1,35 @@
 # All libraries used for the environment
 # Imports
-import gymnasium as gym
-import numpy as np
-from gymnasium import spaces
-import pygame
+import os
 import random
 import time
 from collections import deque
 
+# FLAPPY_HEADLESS=1 runs the game without a window and without sound, for
+# training and evaluating on a machine with no screen. It has to be set
+# before pygame starts, so it is read here and not in the class.
+HEADLESS = os.environ.get('FLAPPY_HEADLESS') == '1'
+if HEADLESS:
+    os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
+    os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
+os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+import pygame
+
 ####################
 # Global Variables
 ####################
+
+# The assets sit next to this file, so the scripts run from any folder
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+
+
+def sprite(name):
+    return os.path.join(ASSETS, 'sprites', name)
+
 
 # Initialize Pygame
 pygame.init()
@@ -24,6 +43,8 @@ SCREEN_HEIGHT = 600
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 
 # Velocity and physics
+# SPEED is the upward speed a flap gives. The models in models/ were trained
+# with 20; it was set to 18 afterwards. FlappyBird(flap_speed=...) overrides it.
 SPEED = 18
 GRAVITY = 2.5
 GAME_SPEED = 20
@@ -43,14 +64,24 @@ HEIGHT = SCREEN_HEIGHT
 WIDTH = SCREEN_WIDTH
 
 # Background image
-BACKGROUND = pygame.image.load('assets/sprites/background-day.png')
+BACKGROUND = pygame.image.load(sprite('background-day.png'))
 BACKGROUND = pygame.transform.scale(BACKGROUND, (SCREEN_WIDTH, SCREEN_HEIGHT))
-BEGIN_IMAGE = pygame.image.load('assets/sprites/message.png').convert_alpha()
+BEGIN_IMAGE = pygame.image.load(sprite('message.png')).convert_alpha()
 
 # Audio for wing, dead, and point
-wing = 'assets/audio/wing.wav'
-hit = 'assets/audio/hit.wav'
-point = 'assets/audio/point.wav'
+wing = os.path.join(ASSETS, 'audio', 'wing.wav')
+hit = os.path.join(ASSETS, 'audio', 'hit.wav')
+point = os.path.join(ASSETS, 'audio', 'point.wav')
+
+
+class _Silent:
+    """Stands in for a sound when sound is off or there is no audio device."""
+
+    def play(self):
+        pass
+
+    def set_volume(self, volume):
+        pass
 
 ##########################
 # Flappy Bird Environment
@@ -63,13 +94,23 @@ point = 'assets/audio/point.wav'
 ##########################
 
 class FlappyBird(gym.Env):
-    metadata = {'render.modes': ['human']}
+    metadata = {'render_modes': ['human']}
 
     # Initialize flappy bird game, make sure all self values exist
     # Here we also define our observation space and action space
+    #
+    # render:     draw every step in the window (True, as before) or only when
+    #             render() is called (False: much faster, for training)
+    # sound:      play the wing, point and hit sounds
+    # fps:        the most steps a second when drawing
+    # flap_speed: the upward speed a flap gives (see SPEED above)
 
-    def __init__(self):
+    def __init__(self, render=True, sound=True, fps=100, flap_speed=SPEED):
         super(FlappyBird, self).__init__()
+
+        self.render_every_step = render and not HEADLESS
+        self.fps = fps
+        self.flap_speed = flap_speed
 
         # Define action space
         self.action_space = spaces.Discrete(2)  # Flap [1], Not flap [0]
@@ -81,12 +122,17 @@ class FlappyBird(gym.Env):
         self.start_time = time.time()
 
         # Initialize mixer and load sounds
-        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
-        pygame.mixer.set_num_channels(8)  # Adjust based on your needs
-
-        self.wing_sound = pygame.mixer.Sound(wing)
-        self.hit_sound = pygame.mixer.Sound(hit)
-        self.point_sound = pygame.mixer.Sound(point)
+        # Without sound, or on a machine with no audio device, the game runs silent
+        self.wing_sound = self.hit_sound = self.point_sound = _Silent()
+        if sound and not HEADLESS:
+            try:
+                pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+                pygame.mixer.set_num_channels(8)  # Adjust based on your needs
+                self.wing_sound = pygame.mixer.Sound(wing)
+                self.hit_sound = pygame.mixer.Sound(hit)
+                self.point_sound = pygame.mixer.Sound(point)
+            except pygame.error as error:
+                print(f"No sound: {error}")
 
         # Optional: Set volume for each sound
         self.wing_sound.set_volume(0.5)  # Range: 0.0 to 1.0
@@ -96,7 +142,7 @@ class FlappyBird(gym.Env):
         # Set screen, clock, bird, and pipe with configurable FPS
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock = pygame.time.Clock()
-        self.bird = Bird(self.wing_sound)  # Pass wing_sound to Bird
+        self.bird = Bird(self.wing_sound, self.flap_speed)  # Pass wing_sound to Bird
         self.pipe_group = pygame.sprite.Group()
 
         # Pipes positions
@@ -114,11 +160,15 @@ class FlappyBird(gym.Env):
         self.ground_group = pygame.sprite.Group()
 
         # Observation space
+        # The five numbers are not really whole numbers between 0 and 255 (a
+        # distance can be negative or larger). It stays declared like this
+        # because the saved models were trained against exactly this space and
+        # stable-baselines3 refuses to load them into any other.
         self.observation_space = spaces.Box(low=0, high=255,
                                             shape=(5,), dtype=np.int32)
 
         # Load number images 0.png to 9.png
-        self.number_images = [pygame.image.load(f'assets/sprites/{i}.png').convert_alpha() for i in range(10)]
+        self.number_images = [pygame.image.load(sprite(f'{i}.png')).convert_alpha() for i in range(10)]
 
         # Load background and begin images
         screen.blit(BACKGROUND, (0, 0))
@@ -190,12 +240,13 @@ class FlappyBird(gym.Env):
     # Frame by frame
     ############################################
     def step(self, action):
-        self.render()
+        if self.render_every_step:
+            self.render()
         obs = self._get_observation()
 
         # Get everything from the reward value
         reward, terminated, truncated = self.reward_value()
-        info = {}
+        info = {'score': self.pipes_passed}
 
         # Store every action
         self.prev_actions.append(action)
@@ -208,7 +259,6 @@ class FlappyBird(gym.Env):
 
         # If agent chooses 1 instead of 0
         if action == 1:
-            print("Action 1 detected: Flap")  # Debugging line
             self.bird.bump()  # This plays the wing sound
 
         # Keep adding pipes on screen
@@ -237,13 +287,16 @@ class FlappyBird(gym.Env):
         # When reset is called, everything will be reset
         # Reset is called every truncated or terminated
         # Or at start
-        reward = 0
-        truncated = False
-        terminated = False
+        super().reset(seed=seed)
 
-        self.info = {}
+        # With a seed, the pipes (and the bird's colour) of this run and the
+        # runs after it are the same every time. Without one, nothing changes.
+        if seed is not None:
+            random.seed(seed)
+
+        self.info = {'score': 0}
         self.prev_actions.clear()
-        self.bird = Bird(self.wing_sound)  # Pass wing_sound to Bird
+        self.bird = Bird(self.wing_sound, self.flap_speed)  # Pass wing_sound to Bird
         self.pipe_group = pygame.sprite.Group()
         self.ground_group = pygame.sprite.Group()
         self.pipes_passed = 0  # Reset the score
@@ -265,6 +318,23 @@ class FlappyBird(gym.Env):
     ##################################
 
     def render(self, mode='human'):
+        # Keep the window alive: without this the window manager marks it
+        # "not responding" and it cannot be closed
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                raise SystemExit
+
+        self.draw()
+
+        # Set game ticks per second
+        pygame.display.update()
+        if not HEADLESS:
+            self.clock.tick(self.fps)
+
+    # Draw one frame on self.screen without showing it
+    # (render() shows it; evaluate.py saves it as a picture)
+    def draw(self):
         # Render background
         self.screen.fill((255, 255, 255))
         self.screen.blit(BACKGROUND, (0, 0))
@@ -281,10 +351,6 @@ class FlappyBird(gym.Env):
 
         # Draw the score
         self.draw_score()
-
-        # Set game ticks per second
-        pygame.display.update()
-        self.clock.tick(100)  # Adjust FPS as needed
 
     def draw_score(self):
         # Convert score to string
@@ -324,10 +390,10 @@ class FlappyBird(gym.Env):
                 or self.bird.rect.top <= 0 \
                 or self.bird.rect.bottom >= SCREEN_HEIGHT - GROUND_HEIGHT:
             reward -= 100  # Large negative reward upon death
+            # The bird died: that is "terminated". "truncated" is for a run cut
+            # off from outside (a time limit), which this game does not have.
             terminated = True
-            truncated = True
             self.hit_sound.play()  # Play hit sound
-            print("Hit sound played")  # Debugging line
             return reward, terminated, truncated
 
         # Small positive reward for each timestep the bird is alive
@@ -339,7 +405,6 @@ class FlappyBird(gym.Env):
                 setattr(pipe, 'passed', True)
                 reward += 10  # Reward for passing a pipe pair
                 self.point_sound.play()  # Play point sound
-                print("Point sound played")  # Debugging line
                 self.pipes_passed += 1  # Increment the score
 
                 # Increase rewards for passing pipes after a certain number
@@ -363,12 +428,10 @@ class FlappyBird(gym.Env):
 # In-game classes
 # Bird(), Ground(), Pipes()
 ##############################
-import pygame
-import random
 
 class Bird(pygame.sprite.Sprite):
 
-    def __init__(self, wing_sound):
+    def __init__(self, wing_sound, flap_speed=SPEED):
         pygame.sprite.Sprite.__init__(self)
 
         # Store the wing sound
@@ -376,21 +439,21 @@ class Bird(pygame.sprite.Sprite):
 
         # Load images for each color
         self.blue_images = [
-            pygame.image.load('assets/sprites/bluebird-upflap.png').convert_alpha(),
-            pygame.image.load('assets/sprites/bluebird-midflap.png').convert_alpha(),
-            pygame.image.load('assets/sprites/bluebird-downflap.png').convert_alpha()
+            pygame.image.load(sprite('bluebird-upflap.png')).convert_alpha(),
+            pygame.image.load(sprite('bluebird-midflap.png')).convert_alpha(),
+            pygame.image.load(sprite('bluebird-downflap.png')).convert_alpha()
         ]
 
         self.yellow_images = [
-            pygame.image.load('assets/sprites/yellowbird-upflap.png').convert_alpha(),
-            pygame.image.load('assets/sprites/yellowbird-midflap.png').convert_alpha(),
-            pygame.image.load('assets/sprites/yellowbird-downflap.png').convert_alpha()
+            pygame.image.load(sprite('yellowbird-upflap.png')).convert_alpha(),
+            pygame.image.load(sprite('yellowbird-midflap.png')).convert_alpha(),
+            pygame.image.load(sprite('yellowbird-downflap.png')).convert_alpha()
         ]
 
         self.red_images = [
-            pygame.image.load('assets/sprites/redbird-upflap.png').convert_alpha(),
-            pygame.image.load('assets/sprites/redbird-midflap.png').convert_alpha(),
-            pygame.image.load('assets/sprites/redbird-downflap.png').convert_alpha()
+            pygame.image.load(sprite('redbird-upflap.png')).convert_alpha(),
+            pygame.image.load(sprite('redbird-midflap.png')).convert_alpha(),
+            pygame.image.load(sprite('redbird-downflap.png')).convert_alpha()
         ]
 
         # Randomly choose a color
@@ -403,7 +466,8 @@ class Bird(pygame.sprite.Sprite):
         elif self.color == 'red':
             self.original_images = self.red_images
 
-        self.speed = SPEED
+        self.flap_speed = flap_speed
+        self.speed = flap_speed
 
         self.current_image = 0
         self.image = self.original_images[self.current_image]
@@ -457,9 +521,8 @@ class Bird(pygame.sprite.Sprite):
         self.mask = pygame.mask.from_surface(self.image)
 
     def bump(self):
-        self.speed = -SPEED
+        self.speed = -self.flap_speed
         # Play wing sound
-        print("Flap sound played")  # Debugging line
         self.wing_sound.play()
         # Optionally, set a specific tilt angle when flapping
         self.angle = self.max_up_angle
@@ -482,7 +545,7 @@ class Pipe(pygame.sprite.Sprite):
         pygame.sprite.Sprite.__init__(self)
 
         self.inverted = inverted
-        self.image = pygame.image.load('assets/sprites/pipe-green.png').convert_alpha()
+        self.image = pygame.image.load(sprite('pipe-green.png')).convert_alpha()
         self.image = pygame.transform.scale(self.image, (PIPE_WIDTH, PIPE_HEIGHT))
 
         self.rect = self.image.get_rect()
@@ -504,7 +567,7 @@ class Ground(pygame.sprite.Sprite):
 
     def __init__(self, xpos):
         pygame.sprite.Sprite.__init__(self)
-        self.image = pygame.image.load('assets/sprites/base.png').convert_alpha()
+        self.image = pygame.image.load(sprite('base.png')).convert_alpha()
         self.image = pygame.transform.scale(self.image, (GROUND_WIDTH, GROUND_HEIGHT))
 
         self.mask = pygame.mask.from_surface(self.image)
